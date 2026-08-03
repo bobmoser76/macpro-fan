@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Robert Moser
+
+from __future__ import annotations
+import configparser, json, os, subprocess, sys, time
+from pathlib import Path
+CONFIG=Path('/etc/macpro-fan.conf'); STATE=Path('/run/macpro-fan/state.json'); HISTORY=Path('/var/lib/macpro-fan/history.json'); SERVICE='macpro-fan-control.service'
+def systemctl(a): return subprocess.call(['sudo','systemctl',a,SERVICE])
+def active():
+ r=subprocess.run(['systemctl','is-active',SERVICE],capture_output=True,text=True); return r.stdout.strip() or r.stderr.strip()
+def read_json(p):
+ try:return json.loads(p.read_text())
+ except Exception:return {}
+def temp(v): return 'n/a' if v is None else f'{v:.1f}°C'
+def bar(v,lo,hi,w=24):
+ if v is None:return '?'*w
+ ratio=max(0,min(1,(float(v)-lo)/(hi-lo))); n=round(ratio*w); return '█'*n+'░'*(w-n)
+def status():
+ d=read_json(STATE); print(f'Service:       {active()}')
+ if not d: print('Runtime state is unavailable.'); return 0
+ age=max(0,int(time.time()-d.get('timestamp',time.time())))
+ print(f"Selected:      {d.get('selected_profile','n/a')}")
+ print(f"Active:        {d.get('active_profile','n/a')}\n")
+ print(f"CPU:           {temp(d.get('cpu'))}")
+ print(f"GPU0:          {temp(d.get('gpu0'))}  busy={d.get('gpu0_busy','n/a')}%")
+ print(f"GPU1:          {temp(d.get('gpu1'))}  busy={d.get('gpu1_busy','n/a')}%")
+ print(f"Load/core:     {d.get('load_per_core','n/a')}\n")
+ print(f"Control:       {temp(d.get('control_temp'))} ({d.get('control_source','n/a')})")
+ print(f"Fan:           {d.get('fan_rpm','n/a')} RPM")
+ print(f"Target:        {d.get('target_rpm','n/a')} RPM")
+ print(f"Mode:          {d.get('mode','n/a')}")
+ print(f"Polling:       {d.get('poll_interval','n/a')} seconds")
+ print(f'Updated:       {age} seconds ago')
+ if d.get('error'): print(f"Error:         {d['error']}")
+ return 0
+def monitor():
+ try:
+  while True:
+   d=read_json(STATE); os.system('clear'); print('Mac Pro 6,1 Fan Controller\n')
+   print(f'Service   {active()}'); print(f"Profile   {d.get('selected_profile','n/a')} → {d.get('active_profile','n/a')}"); print(f"Mode      {d.get('mode','n/a')}\n")
+   cpu=d.get('cpu'); g0=d.get('gpu0'); g1=d.get('gpu1'); fan=d.get('fan_rpm'); goal=d.get('target_rpm')
+   print(f'CPU   {bar(cpu,35,90)} {temp(cpu)}'); print(f"GPU0  {bar(g0,35,90)} {temp(g0)}  busy={d.get('gpu0_busy','n/a')}%")
+   print(f"GPU1  {bar(g1,35,90)} {temp(g1)}  busy={d.get('gpu1_busy','n/a')}%")
+   print(f"Fan   {bar(fan,790,1900)} {fan or 'n/a'} RPM"); print(f"Goal  {bar(goal,790,1900)} {goal or 'n/a'} RPM\n"); print('Ctrl+C to exit'); time.sleep(1)
+ except KeyboardInterrupt:return 0
+def history():
+ d=read_json(HISTORY)
+ if not d: print('No history is available yet.'); return 0
+ samples=max(1,int(d.get('samples',0))); avg=int(d.get('fan_sum',0)/samples); up=int(time.time()-d.get('started',time.time()))
+ print(f'Tracked time:       {up//3600}h {(up%3600)//60}m'); print(f'Samples:            {samples}')
+ print(f"CPU peak:           {d.get('cpu_peak',0):.1f}°C"); print(f"GPU0 peak:          {d.get('gpu0_peak',0):.1f}°C"); print(f"GPU1 peak:          {d.get('gpu1_peak',0):.1f}°C")
+ print(f'Average fan:        {avg} RPM'); print(f"Maximum fan:        {d.get('fan_peak',0)} RPM"); print(f"Emergency events:   {d.get('emergency_events',0)}"); return 0
+def set_profile(req):
+ c=configparser.ConfigParser()
+ if not c.read(CONFIG): print(f'Cannot read {CONFIG}',file=sys.stderr); return 1
+ avail=['Auto']+[s.split(':',1)[1] for s in c.sections() if s.startswith('Profile:')]; match=next((p for p in avail if p.lower()==req.lower()),None)
+ if not match: print('Available profiles: '+', '.join(avail),file=sys.stderr); return 1
+ c.setdefault('General',{}); c['General']['Profile']=match; tmp=CONFIG.with_suffix('.tmp')
+ with tmp.open('w') as h:c.write(h)
+ os.replace(tmp,CONFIG); print(f'Selected profile: {match}'); print('The service will reload it automatically.'); return 0
+def usage(): print('Usage: macpro-fan {status|monitor|history|reset-history|test|start|stop|restart|profile PROFILE}')
+def main():
+ if len(sys.argv)<2: usage(); return 1
+ c=sys.argv[1].lower()
+ if c=='status': return status()
+ if c=='monitor': return monitor()
+ if c=='history': return history()
+ if c=='reset-history': return subprocess.call(['sudo','rm','-f',str(HISTORY)])
+ if c=='test': return subprocess.call(['sudo','/usr/local/sbin/macpro-fan-control.py','--check'])
+ if c in {'start','stop','restart'}: return systemctl(c)
+ if c=='profile' and len(sys.argv)==3:return set_profile(sys.argv[2])
+ usage(); return 1
+if __name__=='__main__': raise SystemExit(main())

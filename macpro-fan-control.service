@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Robert Moser
+
+[Unit]
+Description=Mac Pro 6,1 Intelligent Fan Controller
+After=multi-user.target
+Conflicts=mbpfan.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/macpro-fan-control.py
+ExecStopPost=/bin/sh -c 'echo 0 > /sys/devices/platform/applesmc.768/fan1_manual'
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+RuntimeDirectory=macpro-fan
+RuntimeDirectoryMode=0755
+StateDirectory=macpro-fan
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
