@@ -19,4 +19,4 @@ python3 -m py_compile /usr/local/bin/macpro-fan
 systemctl daemon-reload
 /usr/local/sbin/macpro-fan-control.py --check
 systemctl enable --now macpro-fan-control.service
-echo; echo 'Installed macpro-fan v3.'; echo "Backup: $BACKUP"; echo 'Run: macpro-fan status'
+echo; echo 'echo "Installed macpro-fan v$(cat "$ROOT/VERSION")."'; echo "Backup: $BACKUP"; echo 'Run: macpro-fan status'
