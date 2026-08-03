@@ -48,8 +48,8 @@ class Profile:
 
 @dataclass
 class AutoConfig:
-    idle_load_per_core: float
-    performance_load_per_core: float
+    idle_cpu_busy: float
+    performance_cpu_busy: float
     idle_gpu_busy: int
     performance_gpu_busy: int
     idle_hold_seconds: float
@@ -156,8 +156,8 @@ def load_config() -> tuple[str, dict[str, Profile], AutoConfig]:
         raise RuntimeError('No profiles found')
     a = cfg['Auto'] if 'Auto' in cfg else {}
     auto = AutoConfig(
-        idle_load_per_core=float(a.get('IdleLoadPerCore', 0.20)),
-        performance_load_per_core=float(a.get('PerformanceLoadPerCore', 0.70)),
+        idle_cpu_busy=float(a.get('IdleCPUBusy', 10.0)),
+        performance_cpu_busy=float(a.get('PerformanceCPUBusy', 65.0)),
         idle_gpu_busy=int(a.get('IdleGPUBusy', 10)),
         performance_gpu_busy=int(a.get('PerformanceGPUBusy', 60)),
         idle_hold_seconds=float(a.get('IdleHoldSeconds', 120)),
@@ -168,12 +168,39 @@ def load_config() -> tuple[str, dict[str, Profile], AutoConfig]:
     return selected, profiles, auto
 
 
-def load_average_per_core() -> float:
-    try:
-        load1 = float(Path('/proc/loadavg').read_text().split()[0])
-        return load1 / max(1, os.cpu_count() or 1)
-    except Exception:
+def read_cpu_times() -> tuple[int, int]:
+    fields = Path('/proc/stat').read_text().splitlines()[0].split()
+
+    if not fields or fields[0] != 'cpu':
+        raise RuntimeError('Unable to read aggregate CPU statistics')
+
+    values = [int(value) for value in fields[1:]]
+
+    if len(values) < 4:
+        raise RuntimeError('Incomplete aggregate CPU statistics')
+
+    idle = values[3]
+    iowait = values[4] if len(values) > 4 else 0
+
+    return idle + iowait, sum(values)
+
+
+def calculate_cpu_busy_percent(
+    previous: tuple[int, int],
+    current: tuple[int, int],
+) -> float:
+    previous_idle, previous_total = previous
+    current_idle, current_total = current
+
+    idle_delta = current_idle - previous_idle
+    total_delta = current_total - previous_total
+
+    if total_delta <= 0:
         return 0.0
+
+    busy = 100.0 * (1.0 - idle_delta / total_delta)
+
+    return max(0.0, min(100.0, busy))
 
 
 class History:
@@ -223,6 +250,7 @@ class Controller:
         self.history = History()
         self.last_history_save = 0.0
         self.was_emergency = False
+        self.previous_cpu_times = read_cpu_times()
 
     def validate(self) -> None:
         missing = [str(p) for p in (FAN_MANUAL, FAN_OUTPUT, FAN_INPUT, FAN_MIN, FAN_MAX) if not p.exists()]
@@ -257,10 +285,20 @@ class Controller:
         self.config_mtime = mtime
         print(f'Reloaded configuration; selected={self.selected}', flush=True)
 
-    def choose_auto_profile(self, load_per_core: float, gpu_busy: int, hottest: float) -> None:
+    def choose_auto_profile(self, cpu_busy: float, gpu_busy: int, hottest: float) -> None:
         now = time.monotonic()
-        high = load_per_core >= self.auto.performance_load_per_core or gpu_busy >= self.auto.performance_gpu_busy or hottest >= 68.0
-        idle = load_per_core <= self.auto.idle_load_per_core and gpu_busy <= self.auto.idle_gpu_busy and hottest <= 52.0
+
+        high = (
+            cpu_busy >= self.auto.performance_cpu_busy
+            or gpu_busy >= self.auto.performance_gpu_busy
+            or hottest >= 68.0
+        )
+
+        idle = (
+            cpu_busy <= self.auto.idle_cpu_busy
+            and gpu_busy <= self.auto.idle_gpu_busy
+            and hottest <= 52.0
+        )
         if high:
             self.performance_since = self.performance_since or now
             self.idle_since = None
@@ -324,10 +362,19 @@ class Controller:
                     gpus = read_gpus()
                     gpu0, gpu1 = gpus[0]['temp'], gpus[1]['temp']
                     gpu_busy = max(g['busy'] or 0 for g in gpus)
-                    load_per_core = load_average_per_core()
+                    current_cpu_times = read_cpu_times()
+
+                    cpu_busy = calculate_cpu_busy_percent(
+                        self.previous_cpu_times,
+                        current_cpu_times,
+                    )
+
+                    self.previous_cpu_times = current_cpu_times
+
                     actual_hot = max(cpu, gpu0, gpu1)
+
                     if self.selected.lower() == 'auto':
-                        self.choose_auto_profile(load_per_core, gpu_busy, actual_hot)
+                        self.choose_auto_profile(cpu_busy, gpu_busy, actual_hot)
                     controls = {'CPU': cpu, 'GPU0': gpu0 + self.profile.gpu_bias, 'GPU1': gpu1 + self.profile.gpu_bias}
                     source = max(controls, key=controls.get)
                     self.window.append(controls[source])
@@ -358,7 +405,7 @@ class Controller:
                         'active_profile': self.profile.name, 'cpu': cpu,
                         'gpu0': gpu0, 'gpu1': gpu1,
                         'gpu0_busy': gpus[0]['busy'], 'gpu1_busy': gpus[1]['busy'],
-                        'load_per_core': load_per_core, 'control_temp': control,
+                        'cpu_busy': cpu_busy, 'control_temp': control,
                         'control_source': source, 'fan_rpm': actual_rpm,
                         'target_rpm': target, 'mode': mode,
                         'poll_interval': interval,
@@ -367,7 +414,7 @@ class Controller:
                         print(
                             f'selected={self.selected} active={self.profile.name} '
                             f'CPU={cpu:.1f}C GPU0={gpu0:.1f}C GPU1={gpu1:.1f}C '
-                            f'busy={gpu_busy}% load/core={load_per_core:.2f} '
+                            f'gpu_busy={gpu_busy}% cpu_busy={cpu_busy:.1f}% '
                             f'control={control:.1f}C({source}) fan={actual_rpm}RPM '
                             f'target={target}RPM mode={mode}', flush=True)
                         self.last_temp, self.last_target, self.last_mode = control, target, mode
